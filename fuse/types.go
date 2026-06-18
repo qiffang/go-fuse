@@ -491,6 +491,11 @@ type FsyncIn struct {
 	Padding    uint32
 }
 
+type SyncFsIn struct {
+	InHeader
+	Padding uint64
+}
+
 type OutHeader struct {
 	Length uint32
 	Status int32

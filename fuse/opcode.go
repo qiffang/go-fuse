@@ -717,6 +717,7 @@ func init() {
 		_OP_SETLK:           LkIn{},
 		_OP_SETLKW:          LkIn{},
 		_OP_SETXATTR:        SetXAttrIn{},
+		_OP_SYNCFS:          SyncFsIn{},
 		_OP_WRITE:           WriteIn{},
 	} {
 		operationHandlers[op].InType = f
