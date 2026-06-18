@@ -443,6 +443,10 @@ func doStatFs(server *protocolServer, req *request) {
 	}
 }
 
+func doSyncFs(server *protocolServer, req *request) {
+	req.status = server.fileSystem.SyncFs(req.cancel, req.inHeader())
+}
+
 func doIoctl(server *protocolServer, req *request) {
 	req.status = server.fileSystem.Ioctl(req.cancel, (*IoctlIn)(req.inData()), req.inPayload, (*IoctlOut)(req.outData()),
 		req.outPayload)
@@ -628,6 +632,7 @@ func init() {
 		_OP_SYMLINK:         doSymlink,
 		_OP_RENAME:          doRename,
 		_OP_STATFS:          doStatFs,
+		_OP_SYNCFS:          doSyncFs,
 		_OP_IOCTL:           doIoctl,
 		_OP_DESTROY:         doDestroy,
 		_OP_NOTIFY_REPLY:    doNotifyReply,

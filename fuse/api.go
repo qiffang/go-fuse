@@ -466,6 +466,7 @@ type RawFileSystem interface {
 	FsyncDir(cancel <-chan struct{}, input *FsyncIn) (code Status)
 
 	StatFs(cancel <-chan struct{}, input *InHeader, out *StatfsOut) (code Status)
+	SyncFs(cancel <-chan struct{}, input *InHeader) (code Status)
 
 	Statx(cancel <-chan struct{}, input *StatxIn, out *StatxOut) (code Status)
 	// This is called on processing the first request. The

@@ -486,6 +486,10 @@ func (c *rawBridge) StatFs(cancel <-chan struct{}, header *fuse.InHeader, out *f
 	return fuse.OK
 }
 
+func (c *rawBridge) SyncFs(cancel <-chan struct{}, header *fuse.InHeader) fuse.Status {
+	return fuse.ENOSYS
+}
+
 func (c *rawBridge) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
 	node := c.toInode(input.NodeId)
 	opened := node.mount.getOpenedFile(input.Fh)

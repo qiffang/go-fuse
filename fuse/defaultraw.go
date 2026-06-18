@@ -34,6 +34,10 @@ func (fs *defaultRawFileSystem) StatFs(cancel <-chan struct{}, header *InHeader,
 	return ENOSYS
 }
 
+func (fs *defaultRawFileSystem) SyncFs(cancel <-chan struct{}, header *InHeader) Status {
+	return ENOSYS
+}
+
 func (fs *defaultRawFileSystem) Lookup(cancel <-chan struct{}, header *InHeader, name string, out *EntryOut) (code Status) {
 	return ENOSYS
 }
