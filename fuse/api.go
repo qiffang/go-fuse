@@ -354,6 +354,20 @@ type MountOptions struct {
 	// checks to the kernel. For requests that create new inodes, FUSE will send
 	// the mapped UID/GIDs. For all other requests, FUSE will send "-1".
 	IDMappedMount bool
+
+	// EnableDirectIoMmap, if set, asks the kernel to allow mmap on files
+	// opened with FOPEN_DIRECT_IO. This advertises the
+	// CAP_DIRECT_IO_ALLOW_MMAP capability (Linux 6.6+) during FUSE_INIT.
+	//
+	// Without this capability, the kernel rejects mmap(MAP_SHARED) on
+	// FOPEN_DIRECT_IO handles with ENODEV. Filesystems that return
+	// FOPEN_DIRECT_IO for correctness (e.g. to bypass the kernel page
+	// cache for coherence) but still need to support mmap consumers
+	// (such as SQLite in WAL mode with a non-zero mmap_size) should set
+	// this option. The capability is only advertised if the running
+	// kernel supports it; on older kernels or macFUSE the flag is a
+	// no-op and mmap on DIRECT_IO handles will still fail.
+	EnableDirectIoMmap bool
 }
 
 // RawFileSystem is an interface close to the FUSE wire protocol.
