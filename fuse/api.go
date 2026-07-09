@@ -111,6 +111,11 @@
 // run without any privileges and without needing `fusermount`, as the parent
 // process performs all privileged operations.
 //
+// For process handoff where the receiver should not rely on a `/dev/fd/N`
+// mountpoint, use Server.ExportFd and ImportFd. ExportFd duplicates the active
+// FUSE device fd for caller-owned transfer, and ImportFd creates a server from
+// an already-mounted fd without calling mount(2).
+//
 // The "privileged parent" is usually a container manager like Singularity [2],
 // but for testing, it can also be  the `mount.fuse3` helper with the
 // `drop_privileges,setuid=$USER` flags. Example below for gocryptfs:

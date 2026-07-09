@@ -77,6 +77,11 @@ type Server struct {
 
 	// for implementing single threaded processing.
 	requestProcessingMu sync.Mutex
+
+	quiesceMu        sync.Mutex
+	quiesceCond      *sync.Cond
+	quiescing        bool
+	inflightRequests int
 }
 
 // SetDebug is deprecated. Use MountOptions.Debug instead.
@@ -156,12 +161,7 @@ func alignSlice(buf []byte, alignedByte, blockSize, size uintptr) []byte {
 	return buf[:size]
 }
 
-// NewServer creates a FUSE server and attaches ("mounts") it to the
-// `mountPoint` directory.
-//
-// See the "Mount styles" section in the package documentation if you want to
-// know about the inner workings of the mount process. Usually you do not.
-func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server, error) {
+func copyMountOptions(fs RawFileSystem, opts *MountOptions) MountOptions {
 	if opts == nil {
 		opts = &MountOptions{
 			MaxBackground: _DEFAULT_BACKGROUND_TASKS,
@@ -192,7 +192,22 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		o.Name = strings.Replace(name[:l], ",", ";", -1)
 	}
+	return o
+}
 
+func normalizeMountPoint(mountPoint string) (string, error) {
+	mountPoint = filepath.Clean(mountPoint)
+	if filepath.IsAbs(mountPoint) {
+		return mountPoint, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(filepath.Join(cwd, mountPoint)), nil
+}
+
+func newServer(fs RawFileSystem, o *MountOptions) *Server {
 	maxReaders := runtime.GOMAXPROCS(0)
 	if maxReaders < minMaxReaders {
 		maxReaders = minMaxReaders
@@ -204,9 +219,10 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		protocolServer: protocolServer{
 			fileSystem:  fs,
 			retrieveTab: make(map[uint64]*retrieveCacheRequest),
-			opts:        &o,
+			opts:        o,
 		},
-		opts:         &o,
+		mountFd:      -1,
+		opts:         o,
 		maxReaders:   maxReaders,
 		singleReader: useSingleReader,
 		ready:        make(chan error, 1),
@@ -231,31 +247,46 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
 	}
-	mountPoint = filepath.Clean(mountPoint)
-	if !filepath.IsAbs(mountPoint) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		mountPoint = filepath.Clean(filepath.Join(cwd, mountPoint))
-	}
-	fd, err := mount(mountPoint, &o, ms.ready)
-	if err != nil {
-		return nil, err
-	}
+	return ms
+}
 
+func (ms *Server) attachFd(mountPoint string, fd int) error {
 	ms.mountPoint = mountPoint
 	ms.mountFd = fd
 
 	if code := ms.handleInit(); !code.Ok() {
 		syscall.Close(fd)
-		// TODO - unmount as well?
-		return nil, fmt.Errorf("init: %s", code)
+		ms.mountFd = -1
+		return fmt.Errorf("init: %s", code)
 	}
 
 	// This prepares for Serve being called somewhere, either
 	// synchronously or asynchronously.
 	ms.loops.Add(1)
+	return nil
+}
+
+// NewServer creates a FUSE server and attaches ("mounts") it to the
+// `mountPoint` directory.
+//
+// See the "Mount styles" section in the package documentation if you want to
+// know about the inner workings of the mount process. Usually you do not.
+func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server, error) {
+	o := copyMountOptions(fs, opts)
+	ms := newServer(fs, &o)
+
+	mountPoint, err := normalizeMountPoint(mountPoint)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := mount(mountPoint, &o, ms.ready)
+	if err != nil {
+		return nil, err
+	}
+	if err := ms.attachFd(mountPoint, fd); err != nil {
+		// TODO - unmount as well?
+		return nil, err
+	}
 	return ms, nil
 }
 
@@ -446,6 +477,7 @@ func (ms *Server) Serve() {
 
 	ms.writeMu.Lock()
 	syscall.Close(ms.mountFd)
+	ms.mountFd = -1
 	ms.writeMu.Unlock()
 
 	// shutdown in-flight cache retrieves.
@@ -580,6 +612,10 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if outPayloadSize > 0 {
 		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
 		req.bufferPoolOutputBuf = req.outPayload
+	}
+	if quiesceTracksOpcode(req.inHeader().Opcode) {
+		ms.beginRequestDispatch()
+		defer ms.endRequestDispatch()
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
