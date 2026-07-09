@@ -56,6 +56,8 @@ type request struct {
 type requestAlloc struct {
 	request
 
+	quiesceTracked bool
+
 	// Request storage. For large inputs and outputs, use data
 	// obtained through bufferpool.
 	bufferPoolInputBuf  []byte

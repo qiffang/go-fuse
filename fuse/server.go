@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -50,6 +52,7 @@ type Server struct {
 
 	// I/O with kernel and daemon.
 	mountFd int
+	readMu  sync.Mutex
 
 	opts *MountOptions
 
@@ -77,6 +80,11 @@ type Server struct {
 
 	// for implementing single threaded processing.
 	requestProcessingMu sync.Mutex
+
+	quiesceMu        sync.Mutex
+	quiesceCond      *sync.Cond
+	quiescing        bool
+	inflightRequests int
 }
 
 // SetDebug is deprecated. Use MountOptions.Debug instead.
@@ -156,12 +164,7 @@ func alignSlice(buf []byte, alignedByte, blockSize, size uintptr) []byte {
 	return buf[:size]
 }
 
-// NewServer creates a FUSE server and attaches ("mounts") it to the
-// `mountPoint` directory.
-//
-// See the "Mount styles" section in the package documentation if you want to
-// know about the inner workings of the mount process. Usually you do not.
-func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server, error) {
+func copyMountOptions(fs RawFileSystem, opts *MountOptions) MountOptions {
 	if opts == nil {
 		opts = &MountOptions{
 			MaxBackground: _DEFAULT_BACKGROUND_TASKS,
@@ -192,7 +195,22 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		o.Name = strings.Replace(name[:l], ",", ";", -1)
 	}
+	return o
+}
 
+func normalizeMountPoint(mountPoint string) (string, error) {
+	mountPoint = filepath.Clean(mountPoint)
+	if filepath.IsAbs(mountPoint) {
+		return mountPoint, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(filepath.Join(cwd, mountPoint)), nil
+}
+
+func newServer(fs RawFileSystem, o *MountOptions) *Server {
 	maxReaders := runtime.GOMAXPROCS(0)
 	if maxReaders < minMaxReaders {
 		maxReaders = minMaxReaders
@@ -204,9 +222,10 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		protocolServer: protocolServer{
 			fileSystem:  fs,
 			retrieveTab: make(map[uint64]*retrieveCacheRequest),
-			opts:        &o,
+			opts:        o,
 		},
-		opts:         &o,
+		mountFd:      -1,
+		opts:         o,
 		maxReaders:   maxReaders,
 		singleReader: useSingleReader,
 		ready:        make(chan error, 1),
@@ -231,31 +250,46 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
 	}
-	mountPoint = filepath.Clean(mountPoint)
-	if !filepath.IsAbs(mountPoint) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		mountPoint = filepath.Clean(filepath.Join(cwd, mountPoint))
-	}
-	fd, err := mount(mountPoint, &o, ms.ready)
-	if err != nil {
-		return nil, err
-	}
+	return ms
+}
 
+func (ms *Server) attachFd(mountPoint string, fd int) error {
 	ms.mountPoint = mountPoint
 	ms.mountFd = fd
 
 	if code := ms.handleInit(); !code.Ok() {
 		syscall.Close(fd)
-		// TODO - unmount as well?
-		return nil, fmt.Errorf("init: %s", code)
+		ms.mountFd = -1
+		return fmt.Errorf("init: %s", code)
 	}
 
 	// This prepares for Serve being called somewhere, either
 	// synchronously or asynchronously.
 	ms.loops.Add(1)
+	return nil
+}
+
+// NewServer creates a FUSE server and attaches ("mounts") it to the
+// `mountPoint` directory.
+//
+// See the "Mount styles" section in the package documentation if you want to
+// know about the inner workings of the mount process. Usually you do not.
+func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server, error) {
+	o := copyMountOptions(fs, opts)
+	ms := newServer(fs, &o)
+
+	mountPoint, err := normalizeMountPoint(mountPoint)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := mount(mountPoint, &o, ms.ready)
+	if err != nil {
+		return nil, err
+	}
+	if err := ms.attachFd(mountPoint, fd); err != nil {
+		// TODO - unmount as well?
+		return nil, err
+	}
 	return ms, nil
 }
 
@@ -349,53 +383,133 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	ms.reqReaders++
 	ms.reqMu.Unlock()
 
-	reqIface := ms.reqPool.Get()
-	req = reqIface.(*requestAlloc)
-	destIface := ms.readPool.Get()
-	dest := destIface.([]byte)
+	for {
+		reqIface := ms.reqPool.Get()
+		req = reqIface.(*requestAlloc)
+		destIface := ms.readPool.Get()
+		dest := destIface.([]byte)
 
-	var n int
-	err := handleEINTR(func() error {
+		var n int
 		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
-		return err
-	})
-	if err != nil {
-		code = ToStatus(err)
-		ms.reqPool.Put(reqIface)
+		readTracked := false
+		readMode := requestReadDispatch
+		for {
+			ms.readMu.Lock()
+			readMode = ms.beginRequestRead()
+			readTracked = true
+
+			var ready bool
+			ready, err = ms.waitMountFdReadable()
+			if err == nil && ready {
+				err = handleEINTR(func() error {
+					n, err = syscall.Read(ms.mountFd, dest)
+					return err
+				})
+			}
+			if err == nil && ready {
+				ms.readMu.Unlock()
+				break
+			}
+
+			ms.endRequestDispatch()
+			readTracked = false
+			ms.readMu.Unlock()
+			if err == nil {
+				continue
+			}
+			break
+		}
+		if err != nil {
+			code = ToStatus(err)
+			ms.reqPool.Put(reqIface)
+			ms.readPool.Put(destIface)
+			ms.reqMu.Lock()
+			ms.reqReaders--
+			ms.reqMu.Unlock()
+			return nil, code
+		}
+
+		if ms.latencies != nil {
+			req.startTime = time.Now()
+		}
+		gobbled := req.setInput(dest[:n])
+		if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
+			log.Printf("Short read for input header: %v", req.inputBuf)
+			if readTracked {
+				ms.endRequestDispatch()
+			}
+			ms.reqMu.Lock()
+			ms.reqReaders--
+			ms.reqMu.Unlock()
+			return nil, EINVAL
+		}
+		opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
+		req.quiesceTracked = quiesceTracksOpcode(opCode)
+		if readMode == requestReadInterruptOnly && !quiesceAllowsInterruptOnlyOpcode(opCode) {
+			ms.rejectQuiescedRequest(req)
+			ms.endRequestDispatch()
+			req.quiesceTracked = false
+			if !gobbled {
+				ms.readPool.Put(destIface)
+			}
+			ms.returnRequest(req)
+			continue
+		}
+		if !req.quiesceTracked && readTracked {
+			ms.endRequestDispatch()
+		}
+		/* These messages don't expect reply, so they cost nothing for
+		   the kernel to send. Make sure we're not overwhelmed by not
+		   spawning a new reader.
+		*/
+		needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
+
+		if !gobbled {
+			ms.readPool.Put(destIface)
+		}
 		ms.reqMu.Lock()
+		defer ms.reqMu.Unlock()
 		ms.reqReaders--
-		ms.reqMu.Unlock()
-		return nil, code
-	}
+		if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure && !ms.isQuiescing() {
+			ms.loops.Add(1)
+			go ms.loop()
+		}
 
-	if ms.latencies != nil {
-		req.startTime = time.Now()
+		return req, OK
 	}
-	ms.reqMu.Lock()
-	defer ms.reqMu.Unlock()
-	gobbled := req.setInput(dest[:n])
-	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
-		log.Printf("Short read for input header: %v", req.inputBuf)
-		return nil, EINVAL
-	}
-	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
-	/* These messages don't expect reply, so they cost nothing for
-	   the kernel to send. Make sure we're not overwhelmed by not
-	   spawning a new reader.
-	*/
-	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
+}
 
-	if !gobbled {
-		ms.readPool.Put(destIface)
-	}
-	ms.reqReaders--
-	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
-		ms.loops.Add(1)
-		go ms.loop()
-	}
+const requestReadPollTimeout = 50 * time.Millisecond
 
-	return req, OK
+func (ms *Server) waitMountFdReadable() (bool, error) {
+	fds := []unix.PollFd{{
+		Fd:     int32(ms.mountFd),
+		Events: unix.POLLIN,
+	}}
+	for {
+		n, err := unix.Poll(fds, int(requestReadPollTimeout/time.Millisecond))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+		return true, nil
+	}
+}
+
+func (ms *Server) rejectQuiescedRequest(req *requestAlloc) {
+	req.outputBuf = req.outBuf[:int(sizeOfOutHeader)]
+	copy(req.outputBuf, zeroOutBuf[:])
+	req.status = EAGAIN
+	req.serializeHeader(0)
+	if errno := ms.write(&req.request); errno != OK && ms.opts != nil && ms.opts.Debug {
+		ms.opts.Logger.Printf("writer: Write/Writev failed, err: %v. opcode: %v",
+			errno, operationName(req.inHeader().Opcode))
+	}
 }
 
 // returnRequest returns a request to the pool of unused requests.
@@ -410,6 +524,7 @@ func (ms *Server) returnRequest(req *requestAlloc) {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
+	req.quiesceTracked = false
 	req.clear()
 
 	if p := req.bufferPoolInputBuf; p != nil {
@@ -446,6 +561,7 @@ func (ms *Server) Serve() {
 
 	ms.writeMu.Lock()
 	syscall.Close(ms.mountFd)
+	ms.mountFd = -1
 	ms.writeMu.Unlock()
 
 	// shutdown in-flight cache retrieves.
@@ -562,6 +678,9 @@ exit:
 
 func (ms *Server) handleRequest(req *requestAlloc) Status {
 	defer ms.returnRequest(req)
+	if req.quiesceTracked {
+		defer ms.endRequestDispatch()
+	}
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
