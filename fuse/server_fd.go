@@ -52,3 +52,53 @@ func ImportFd(fs RawFileSystem, mountPoint string, fd int, opts *MountOptions) (
 	}
 	return ms, nil
 }
+
+// ImportFdWithInit creates a FUSE server around an already-mounted,
+// already-initialized FUSE device fd. Unlike ImportFd, it skips the
+// INIT handshake and uses the provided kernel settings from the
+// exporting server. This is required for live fd handoff between
+// processes: the kernel does not re-send INIT on a connection that
+// has already been initialized.
+//
+// kernelSettings must be the InitIn from the original INIT negotiation,
+// as returned by Server.KernelSettings() on the exporting server.
+//
+// On success the server takes ownership of fd and will close it when
+// Serve exits. On failure ImportFdWithInit closes fd before returning.
+func ImportFdWithInit(fs RawFileSystem, mountPoint string, fd int, kernelSettings *InitIn, opts *MountOptions) (*Server, error) {
+	if fd < 0 {
+		return nil, fmt.Errorf("fuse: import fd: invalid fd %d", fd)
+	}
+	if kernelSettings == nil {
+		return nil, fmt.Errorf("fuse: import fd: kernelSettings is required for initialized connections")
+	}
+
+	o := copyMountOptions(fs, opts)
+	ms := newServer(fs, &o)
+
+	mountPoint, err := normalizeMountPoint(mountPoint)
+	if err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+
+	syscall.CloseOnExec(fd)
+	close(ms.ready)
+
+	// Apply kernel settings from the original INIT negotiation.
+	ms.kernelSettings = *kernelSettings
+
+	// Set splice if kernel supports it.
+	if ms.kernelSettings.Minor >= 13 {
+		ms.setSplice()
+	}
+
+	// Initialize the filesystem.
+	ms.fileSystem.Init(ms)
+
+	// Attach the fd without calling handleInit (no INIT expected).
+	ms.mountPoint = mountPoint
+	ms.mountFd = fd
+	ms.loops.Add(1)
+	return ms, nil
+}
