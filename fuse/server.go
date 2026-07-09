@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -50,6 +52,7 @@ type Server struct {
 
 	// I/O with kernel and daemon.
 	mountFd int
+	readMu  sync.Mutex
 
 	opts *MountOptions
 
@@ -380,53 +383,133 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	ms.reqReaders++
 	ms.reqMu.Unlock()
 
-	reqIface := ms.reqPool.Get()
-	req = reqIface.(*requestAlloc)
-	destIface := ms.readPool.Get()
-	dest := destIface.([]byte)
+	for {
+		reqIface := ms.reqPool.Get()
+		req = reqIface.(*requestAlloc)
+		destIface := ms.readPool.Get()
+		dest := destIface.([]byte)
 
-	var n int
-	err := handleEINTR(func() error {
+		var n int
 		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
-		return err
-	})
-	if err != nil {
-		code = ToStatus(err)
-		ms.reqPool.Put(reqIface)
+		readTracked := false
+		readMode := requestReadDispatch
+		for {
+			ms.readMu.Lock()
+			readMode = ms.beginRequestRead()
+			readTracked = true
+
+			var ready bool
+			ready, err = ms.waitMountFdReadable()
+			if err == nil && ready {
+				err = handleEINTR(func() error {
+					n, err = syscall.Read(ms.mountFd, dest)
+					return err
+				})
+			}
+			if err == nil && ready {
+				ms.readMu.Unlock()
+				break
+			}
+
+			ms.endRequestDispatch()
+			readTracked = false
+			ms.readMu.Unlock()
+			if err == nil {
+				continue
+			}
+			break
+		}
+		if err != nil {
+			code = ToStatus(err)
+			ms.reqPool.Put(reqIface)
+			ms.readPool.Put(destIface)
+			ms.reqMu.Lock()
+			ms.reqReaders--
+			ms.reqMu.Unlock()
+			return nil, code
+		}
+
+		if ms.latencies != nil {
+			req.startTime = time.Now()
+		}
+		gobbled := req.setInput(dest[:n])
+		if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
+			log.Printf("Short read for input header: %v", req.inputBuf)
+			if readTracked {
+				ms.endRequestDispatch()
+			}
+			ms.reqMu.Lock()
+			ms.reqReaders--
+			ms.reqMu.Unlock()
+			return nil, EINVAL
+		}
+		opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
+		req.quiesceTracked = quiesceTracksOpcode(opCode)
+		if readMode == requestReadInterruptOnly && !quiesceAllowsInterruptOnlyOpcode(opCode) {
+			ms.rejectQuiescedRequest(req)
+			ms.endRequestDispatch()
+			req.quiesceTracked = false
+			if !gobbled {
+				ms.readPool.Put(destIface)
+			}
+			ms.returnRequest(req)
+			continue
+		}
+		if !req.quiesceTracked && readTracked {
+			ms.endRequestDispatch()
+		}
+		/* These messages don't expect reply, so they cost nothing for
+		   the kernel to send. Make sure we're not overwhelmed by not
+		   spawning a new reader.
+		*/
+		needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
+
+		if !gobbled {
+			ms.readPool.Put(destIface)
+		}
 		ms.reqMu.Lock()
+		defer ms.reqMu.Unlock()
 		ms.reqReaders--
-		ms.reqMu.Unlock()
-		return nil, code
-	}
+		if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure && !ms.isQuiescing() {
+			ms.loops.Add(1)
+			go ms.loop()
+		}
 
-	if ms.latencies != nil {
-		req.startTime = time.Now()
+		return req, OK
 	}
-	ms.reqMu.Lock()
-	defer ms.reqMu.Unlock()
-	gobbled := req.setInput(dest[:n])
-	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
-		log.Printf("Short read for input header: %v", req.inputBuf)
-		return nil, EINVAL
-	}
-	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
-	/* These messages don't expect reply, so they cost nothing for
-	   the kernel to send. Make sure we're not overwhelmed by not
-	   spawning a new reader.
-	*/
-	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
+}
 
-	if !gobbled {
-		ms.readPool.Put(destIface)
-	}
-	ms.reqReaders--
-	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
-		ms.loops.Add(1)
-		go ms.loop()
-	}
+const requestReadPollTimeout = 50 * time.Millisecond
 
-	return req, OK
+func (ms *Server) waitMountFdReadable() (bool, error) {
+	fds := []unix.PollFd{{
+		Fd:     int32(ms.mountFd),
+		Events: unix.POLLIN,
+	}}
+	for {
+		n, err := unix.Poll(fds, int(requestReadPollTimeout/time.Millisecond))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+		return true, nil
+	}
+}
+
+func (ms *Server) rejectQuiescedRequest(req *requestAlloc) {
+	req.outputBuf = req.outBuf[:int(sizeOfOutHeader)]
+	copy(req.outputBuf, zeroOutBuf[:])
+	req.status = EAGAIN
+	req.serializeHeader(0)
+	if errno := ms.write(&req.request); errno != OK && ms.opts != nil && ms.opts.Debug {
+		ms.opts.Logger.Printf("writer: Write/Writev failed, err: %v. opcode: %v",
+			errno, operationName(req.inHeader().Opcode))
+	}
 }
 
 // returnRequest returns a request to the pool of unused requests.
@@ -441,6 +524,7 @@ func (ms *Server) returnRequest(req *requestAlloc) {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
+	req.quiesceTracked = false
 	req.clear()
 
 	if p := req.bufferPoolInputBuf; p != nil {
@@ -594,6 +678,9 @@ exit:
 
 func (ms *Server) handleRequest(req *requestAlloc) Status {
 	defer ms.returnRequest(req)
+	if req.quiesceTracked {
+		defer ms.endRequestDispatch()
+	}
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
@@ -612,10 +699,6 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if outPayloadSize > 0 {
 		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
 		req.bufferPoolOutputBuf = req.outPayload
-	}
-	if quiesceTracksOpcode(req.inHeader().Opcode) {
-		ms.beginRequestDispatch()
-		defer ms.endRequestDispatch()
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
