@@ -30,18 +30,24 @@ func TestImportFdWithInitRejectsNegativeFd(t *testing.T) {
 	}
 }
 
-// TestImportFdWithInitRejectsNilKernelSettings verifies the nil check.
+// TestImportFdWithInitRejectsNilKernelSettings verifies that the nil check
+// closes the fd before returning (documented failure contract).
 func TestImportFdWithInitRejectsNilKernelSettings(t *testing.T) {
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer syscall.Close(fds[0])
 	defer syscall.Close(fds[1])
+	// fds[0] is passed to ImportFdWithInit — it should be closed on failure.
 
 	_, err = ImportFdWithInit(NewDefaultRawFileSystem(), t.TempDir(), fds[0], nil, nil)
 	if err == nil {
 		t.Fatal("ImportFdWithInit should reject nil kernelSettings")
+	}
+
+	// Verify fd was closed by ImportFdWithInit: a second close should fail.
+	if err := syscall.Close(fds[0]); err == nil {
+		t.Fatal("fd should have been closed by ImportFdWithInit on nil kernelSettings failure")
 	}
 }
 
@@ -115,6 +121,51 @@ func TestImportFdWithInitServesGetAttr(t *testing.T) {
 	case <-serveDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve() did not exit after closing peer fd")
+	}
+}
+
+// testInitInspectFS records whether Init sees an attached server
+// (mountFd >= 0 and mountPoint non-empty), matching the ImportFd/NewServer
+// initialization invariant.
+type testInitInspectFS struct {
+	defaultRawFileSystem
+	initMountFd    int
+	initMountPoint string
+}
+
+func (fs *testInitInspectFS) Init(srv *Server) {
+	fs.initMountFd = srv.mountFd
+	fs.initMountPoint = srv.mountPoint
+}
+
+// TestImportFdWithInitCallsInitAfterAttach verifies that Init(ms) observes
+// a server with mountFd and mountPoint already set (not -1/"").
+func TestImportFdWithInitCallsInitAfterAttach(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fds[1])
+
+	ks := InitIn{Major: _FUSE_KERNEL_VERSION, Minor: _OUR_MINOR_VERSION}
+	mountPoint := t.TempDir()
+
+	fs := &testInitInspectFS{initMountFd: -1}
+	srv, err := ImportFdWithInit(fs, mountPoint, fds[0], &ks, nil)
+	if err != nil {
+		t.Fatalf("ImportFdWithInit: %v", err)
+	}
+	// Clean up: close the fd via the server field.
+	defer syscall.Close(srv.mountFd)
+
+	if fs.initMountFd < 0 {
+		t.Fatalf("Init saw mountFd=%d, want >= 0 (server should be attached before Init)", fs.initMountFd)
+	}
+	if fs.initMountPoint == "" {
+		t.Fatal("Init saw empty mountPoint, want non-empty (server should be attached before Init)")
+	}
+	if fs.initMountPoint != mountPoint {
+		t.Fatalf("Init saw mountPoint=%q, want %q", fs.initMountPoint, mountPoint)
 	}
 }
 

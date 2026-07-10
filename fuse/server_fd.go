@@ -70,6 +70,7 @@ func ImportFdWithInit(fs RawFileSystem, mountPoint string, fd int, kernelSetting
 		return nil, fmt.Errorf("fuse: import fd: invalid fd %d", fd)
 	}
 	if kernelSettings == nil {
+		syscall.Close(fd)
 		return nil, fmt.Errorf("fuse: import fd: kernelSettings is required for initialized connections")
 	}
 
@@ -93,12 +94,14 @@ func ImportFdWithInit(fs RawFileSystem, mountPoint string, fd int, kernelSetting
 		ms.setSplice()
 	}
 
-	// Initialize the filesystem.
-	ms.fileSystem.Init(ms)
-
-	// Attach the fd without calling handleInit (no INIT expected).
+	// Attach mountPoint and fd before Init so the filesystem sees
+	// a fully attached server, matching ImportFd/NewServer invariant.
 	ms.mountPoint = mountPoint
 	ms.mountFd = fd
 	ms.loops.Add(1)
+
+	// Initialize the filesystem (after attach, so Init can use server state).
+	ms.fileSystem.Init(ms)
+
 	return ms, nil
 }
